@@ -21,12 +21,8 @@ export async function solveCaptchaDbc(ctx: WalnutContext) {
   // args[0] = output variable name from $[captchaValue] in the description
   const outputVar: string = ctx.args[0];
 
-  // Credentials from test data params — never hardcoded in the description
-  const username: string = (ctx as any).params?.dbcUsername;
-  const password: string = (ctx as any).params?.dbcPassword;
-  if (!username || !password) {
-    throw new Error('[CAPTCHA] Test data must include dbcUsername and dbcPassword');
-  }
+  const username = 'Rohith23';
+  const password = 'Rohith1234';
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
