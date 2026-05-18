@@ -1,7 +1,5 @@
-import type { WalnutContext, WalnutWebContext } from './walnut';
+import type { WalnutContext } from './walnut';
 import * as https from 'https';
-
-import FormData from 'form-data';
 
 /** @walnut_method
  * name: Solve CAPTCHA via DBC
@@ -14,9 +12,9 @@ import FormData from 'form-data';
 export async function solveCaptchaDbc(ctx: WalnutContext) {
   if (ctx.platform !== 'web') throw new Error('solveCaptchaDbc requires web context');
 
-  const webCtx  = ctx as WalnutWebContext;
-  const locator: string = (ctx as any).locator;
-  if (!locator) throw new Error('[CAPTCHA] No locator attached to this step');
+  // The runtime passes a resolved Playwright Locator object via ctx.locator
+  const element = (ctx as any).locator;
+  if (!element) throw new Error('[CAPTCHA] No locator attached to this step');
 
   // args[0] = output variable name from $[captchaValue] in the description
   const outputVar: string = ctx.args[0];
@@ -27,8 +25,7 @@ export async function solveCaptchaDbc(ctx: WalnutContext) {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
   // ── 1. Read element image as base64 ─────────────────────────────────────
-  ctx.log(`[CAPTCHA] Locator: ${locator}`);
-  const element = webCtx.page.locator(locator);
+  ctx.log(`[CAPTCHA] Waiting for CAPTCHA element to be visible…`);
   await element.waitFor({ state: 'visible', timeout: 8000 });
 
   // Detect tag — canvas uses toDataURL (no disk I/O), anything else screenshots
@@ -49,33 +46,49 @@ export async function solveCaptchaDbc(ctx: WalnutContext) {
     ctx.log(`[CAPTCHA] element.screenshot() → ${buf.length} bytes (tag: ${tagName})`);
   }
 
-  // ── 2. Upload to DBC — field: captchafile with base64: prefix ───────────
-  const uploadResp = await new Promise<Record<string, unknown> | null>((resolve) => {
-    const form = new FormData();
-    form.append('username', username);
-    form.append('password', password);
-    form.append('captchafile', `base64:${base64}`);
+  // ── 2. Upload to DBC using hand-rolled multipart/form-data (no npm deps) ─
+  const boundary = `----WalnutBoundary${Date.now().toString(16)}`;
 
-    form.submit(
+  const buildField = (name: string, value: string): Buffer => {
+    const header = `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n`;
+    return Buffer.concat([Buffer.from(header, 'utf8'), Buffer.from(value, 'utf8'), Buffer.from('\r\n', 'utf8')]);
+  };
+
+  const bodyParts: Buffer[] = [
+    buildField('username', username),
+    buildField('password', password),
+    buildField('captchafile', `base64:${base64}`),
+    Buffer.from(`--${boundary}--\r\n`, 'utf8'),
+  ];
+  const bodyBuffer = Buffer.concat(bodyParts);
+
+  const uploadResp = await new Promise<Record<string, unknown> | null>((resolve) => {
+    const req = https.request(
       {
         hostname: 'api.dbcapi.me',
         path: '/api/captcha',
         method: 'POST',
-        headers: { ...form.getHeaders(), Accept: 'application/json' },
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': bodyBuffer.length,
+          Accept: 'application/json',
+        },
       },
-      (err: Error | null, res: import('http').IncomingMessage) => {
-        if (err) {
-          ctx.warn(`[CAPTCHA] Upload error: ${err.message}`);
-          return resolve(null);
-        }
+      (res) => {
         let raw = '';
-        res.on('data', (c: string) => (raw += c));
+        res.on('data', (c: Buffer) => (raw += c.toString()));
         res.on('end', () => {
           try { resolve(JSON.parse(raw)); }
           catch { ctx.warn(`[CAPTCHA] Upload non-JSON: ${raw.substring(0, 150)}`); resolve(null); }
         });
       }
     );
+    req.on('error', (err: Error) => {
+      ctx.warn(`[CAPTCHA] Upload error: ${err.message}`);
+      resolve(null);
+    });
+    req.write(bodyBuffer);
+    req.end();
   });
 
   const captchaId = uploadResp?.['captcha'] as string | undefined;
@@ -91,7 +104,7 @@ export async function solveCaptchaDbc(ctx: WalnutContext) {
         { hostname: 'api.dbcapi.me', path: `/api/captcha/${id}`, headers: { Accept: 'application/json' } },
         (res) => {
           let raw = '';
-          res.on('data', (c) => (raw += c));
+          res.on('data', (c: Buffer) => (raw += c.toString()));
           res.on('end', () => {
             try { resolve(JSON.parse(raw)); }
             catch { reject(new Error(`Poll non-JSON: ${raw.substring(0, 150)}`)); }
@@ -115,7 +128,7 @@ export async function solveCaptchaDbc(ctx: WalnutContext) {
       continue;
     }
 
-    const text      = pollResp['text'] as string | undefined;
+    const text = pollResp['text'] as string | undefined;
     const isCorrect = pollResp['is_correct'];
 
     if (text && String(isCorrect) !== '0') {
